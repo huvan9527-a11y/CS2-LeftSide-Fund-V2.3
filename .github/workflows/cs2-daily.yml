@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: cs2-daily
@@ -40,3 +41,28 @@ jobs:
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "Daily CS2 V2.5 and V2.6 reports"
           git push
+      - name: Notify owner with report links
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          day=$(TZ=Asia/Shanghai date +%F)
+          title="CS2 双报告 ${day}"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --limit 1000 --json title,number \
+            --jq ".[] | select(.title == \"${title}\") | .number" | head -1)
+          if [ -n "$existing" ]; then
+            echo "Today's report issue already exists: #$existing"
+            exit 0
+          fi
+          report_base="https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/reports"
+          cat > /tmp/cs2_daily_notice.md <<EOF
+          @${GITHUB_REPOSITORY_OWNER} 今天的两套评分报告已更新：
+
+          - [V2.5 报告](${report_base}/CS2_V25_Daily_Report_${day}.md)
+          - [V2.6 报告](${report_base}/CS2_V26_Daily_Report_${day}.md)
+          - [查看全部原始结果](https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME}/reports)
+
+          报告按同一轮行情和 K 线生成；评分是观察信号，不保证未来收益。
+          EOF
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$title" --body-file /tmp/cs2_daily_notice.md \
+            --assignee "$GITHUB_REPOSITORY_OWNER"

@@ -2,6 +2,8 @@
 
 `cs2_daily.py` 每天只抓取一次 643 个物品的价格和 K 线，然后用原 V2.5、V2.6 的各自参数分别生成 XLSX、Markdown 和 CSV。GitHub Actions 每天北京时间 20:00 尝试运行，并提交 `reports/` 中两版报告及当天原始快照；实际触发时间可能晚于整点。
 
+成功提交后，workflow 会创建一条当日 Issue，包含两份报告链接，并将仓库所有者指派为负责人；同一天手动重跑不会重复创建。请在 [GitHub 通知设置](https://github.com/settings/notifications) 打开参与和被指派事项的 Email 通知，并确认收件邮箱已验证。GitHub 是否发送邮件取决于账号设置；脚本不会读取或保存邮箱地址。若当天报告生成失败，仓库 Actions 页面会显示失败，但不会发送当日报告 Issue。
+
 ## 加入仓库
 
 将 `cs2_daily.py` 放在仓库根目录，将 `.github/workflows/cs2-daily.yml` 按原目录结构复制到仓库。在仓库 Settings → Secrets and variables → Actions 新增 `STEAMDT_API_KEY`。运行仓库 Actions 中的 `CS2 daily V2.5 and V2.6` → Run workflow 进行首次验证。

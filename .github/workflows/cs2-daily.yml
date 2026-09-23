@@ -21,7 +21,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
       - run: pip install pandas openpyxl requests tqdm
       - name: Run once and create both reports
         env:

@@ -5,6 +5,7 @@
 # 行情/K线: 从 SteamDT 实时 API 获取；不依赖原 CSV、JSON 文件
 # 执行: python cs2_v26_portable.py
 # 可选: STEAMDT_API_KEY 环境变量优先于代码内密钥，CS2_MODE=file 可切到文件行情模式
+# 注意: 代码内密钥是明文，请勿公开分享；运行需要联网、可写目录和依赖包。
 #
 import importlib.util
 import subprocess
@@ -61,7 +62,9 @@ CONFIG = {
     "TIGHTNESS_STEPS": [(0.99, 15), (0.96, 12), (0.93, 9), (0.88, 6), (0.80, 3)],
     "TIGHTNESS_BASE": 1,
     "BID_PREMIUM_FLAG": 1.05,       # 超过5%可能是定向求购；不作为有效买一价
-    "LIQ_STEPS": [(900, 15), (500, 12), (250, 9), (100, 7), (30, 4)],
+    # log10(悠悠挂卖数)分档: 900/500/250/100/30 —— 对数化压缩顶端,
+    # 降低与深度分(buy/sell比)的相关性(原线性档位两者共变严重)
+    "LIQ_STEPS": [(2.954, 15), (2.699, 12), (2.398, 9), (2.0, 7), (1.477, 4)],
     "LIQ_BASE": 2,
     "QUALITY_STAR": 5,
     "QUALITY_LEGEND": 5,
@@ -71,15 +74,21 @@ CONFIG = {
     "KLINE_TYPE": 1,
     "KLINE_MIN_POINTS": 20,
     "KLINE_STALE_HOURS": 12,       # 1–5天观察窗允许半天以内的K线，过期不作今日信号
+    "KLINE_WINDOW_HOURS": 120,     # 回撤位置改用5日窗口(API实测返回90天小时线, 48h只覆盖2天)
+    "KLINE_TREND_HOURS": 720,      # 30日趋势: 识别长期阴跌, 过滤下跌中继
+    "LONG_DECLINE_30D": -0.30,     # 30日跌幅超过30%判为长期阴跌, 不出左侧候选
     "KLINE_MAX_GAP_HOURS": 3,      # 时间锚点缺口过大时不拿旧价代替
     "KLINE_MIN_CHANGES_24H": 2,    # 过少的价格更新不能等同于止跌
     "MIN_PREV_DROP_12H": 0.005,   # 前12h至少跌0.5%才比较减速
     "MIN_PREV_DROP_24H": 0.008,   # 前24h至少跌0.8%才比较减速
-    "POSITION_STEPS": [(0.08, 10), (0.05, 8), (0.03, 6), (0.015, 4), (0.005, 2)],
+    "POSITION_STEPS": [(0.08, 10), (0.05, 8), (0.03, 6), (0.015, 4), (0.005, 2)],  # 作用于5日回撤dd120
     "POSITION_BASE": 0,
     "MIN_CANDIDATE_DRAWDOWN": 0.01,
     "MIN_CANDIDATE_MOMENTUM": 4,
     "MAX_CANDIDATE_REBOUND": 0.15,  # 距48h低点超过15%当作可能已错过左侧
+    # 低点企稳联合判定: 未创新低 且 未大幅反弹 才计分(原两项独立相加, 逻辑不自洽)
+    "REBOUND_FULL": 0.06,           # 反弹<=6%: 企稳分全额
+    "REBOUND_HALF": 0.10,           # 反弹<=10%: 半额; 更远: 0分(左侧位置已过)
 
     # ---- SteamDT开放平台实时API ----
     "USE_LIVE_API": True,          # True且有key=实时拉取; 否则读本地文件
@@ -915,6 +924,18 @@ def api_headers():
     return {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
 
+_HTTP = None
+
+
+def http_session():
+    """复用TCP/TLS连接: 643次K线请求每次省一次握手(约100-300ms)"""
+    global _HTTP
+    if _HTTP is None:
+        _HTTP = requests.Session()
+        _HTTP.headers.update(api_headers())
+    return _HTTP
+
+
 AUTH_CODES = (4001, 4002, 2007)  # 2007=请先申请ApiKey(实测无效key返回此码)
 
 
@@ -965,8 +986,7 @@ def fetch_live_prices(names):
             time.sleep(CONFIG["BATCH_SLEEP"])
         n_call += 1
         try:
-            resp = requests.post(url, headers=api_headers(),
-                                 json={"marketHashNames": chunk}, timeout=60)
+            resp = http_session().post(url, json={"marketHashNames": chunk}, timeout=60)
             data = resp.json()
         except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
             print(f"  批#{n_call}: 网络/解析异常({e}) 将重试", flush=True)
@@ -1034,9 +1054,9 @@ def fetch_live_klines(names):
         got = False
         for attempt in range(2):
             try:
-                data = requests.post(url, headers=api_headers(),
-                                     json={"marketHashName": n, "type": CONFIG["KLINE_TYPE"]},
-                                     timeout=30).json()
+                data = http_session().post(
+                    url, json={"marketHashName": n, "type": CONFIG["KLINE_TYPE"]},
+                    timeout=30).json()
                 if data.get("success") and isinstance(data.get("data"), list):
                     out[n] = data["data"]
                     got = True
@@ -1191,7 +1211,8 @@ def kline_features(raw):
     result = {"valid": False, "age_hours": None, "points": 0, "changes24": 0,
               "r12_prev": None, "r12_now": None, "r24_prev": None, "r24_now": None,
               "dd48": None, "rebound48": None, "new_low_depth": None,
-              "down_prev24": None, "down_now24": None}
+              "down_prev24": None, "down_now24": None,
+              "dd120": None, "r120": None, "trend_720": None}
     if not isinstance(raw, list):
         return result
     by_ts = {}
@@ -1232,6 +1253,19 @@ def kline_features(raw):
     result["r12_prev"] = c12 / c24 - 1 if c12 else None
     result["r24_now"] = price / c24 - 1
     result["r24_prev"] = c24 / c48 - 1 if c48 else None
+
+    # 5日窗口: 回撤位置按120h回撤(策略周期1-5天, 48h只覆盖2天)
+    win_h = CONFIG["KLINE_WINDOW_HOURS"] * 3600
+    last_win = [(t, c) for t, c in points if t >= end - win_h]
+    if last_win:
+        result["dd120"] = max(0.0, 1 - price / max(c for _, c in last_win))
+    c120 = close_hours_ago(CONFIG["KLINE_WINDOW_HOURS"])
+    if c120:
+        result["r120"] = price / c120 - 1
+    # 30日趋势: 识别长期阴跌, 避免把下跌中继误判为左侧
+    c720 = close_hours_ago(CONFIG["KLINE_TREND_HOURS"])
+    if c720:
+        result["trend_720"] = price / c720 - 1
 
     last48 = [(t, c) for t, c in points if t >= end - 48 * 3600]
     if last48:
@@ -1306,243 +1340,6 @@ df = pd.DataFrame(rows)
 if df.empty:
     raise RuntimeError("没有匹配到可评分的物品，请检查实时接口返回的平台字段与物品名称")
 
-
-# 同一份价格表和 K 线快照供两个版本计算。
-base_df = df.copy(deep=True)
-
-# V2.5 独立评分参数。
-CONFIG_V26 = CONFIG.copy()
-CONFIG = CONFIG.copy()
-CONFIG['DEPTH_STEPS'] = [(0.30, 30), (0.20, 26), (0.15, 22), (0.10, 18), (0.06, 12)]
-CONFIG['DEPTH_BASE'] = 5
-CONFIG['DEPTH_MIN_BIDS'] = 5
-CONFIG['DEPTH_LOWBID_CAP'] = 12
-CONFIG['TIGHTNESS_STEPS'] = [(0.99, 20), (0.96, 16), (0.93, 12), (0.88, 8), (0.80, 4)]
-CONFIG['TIGHTNESS_BASE'] = 1
-CONFIG['BID_PREMIUM_FLAG'] = 1.05
-CONFIG['LIQ_STEPS'] = [(900, 15), (500, 12), (250, 9), (100, 7), (30, 4)]
-CONFIG['LIQ_BASE'] = 2
-CONFIG['QUALITY_STAR'] = 20
-CONFIG['QUALITY_LEGEND'] = 18
-CONFIG['QUALITY_BASE'] = 10
-CONFIG['KLINE_TYPE'] = 1
-CONFIG['KLINE_MIN_POINTS'] = 20
-CONFIG['KLINE_MISSING_SCORE'] = 7
-CONFIG['DD_DEPTH_STEPS'] = [(0.20, 10), (0.10, 8), (0.05, 6), (0.03, 4), (0.01, 2)]
-CONFIG['DD_DEPTH_BASE'] = 1
-CONFIG['DD_VOL_STEPS'] = [(0.004, 5), (0.008, 3)]
-CONFIG['DD_VOL_BASE'] = 1
-
-def drawdown_metrics(k):
-    """[[ts,open,close,high,low],...] -> (回撤深度dd, 小时收益波动vol)"""
-    try:
-        closes = [float(x[2]) for x in (k or [])
-                  if isinstance(x, (list, tuple)) and len(x) >= 5
-                  and x[2] is not None and float(x[2] or 0) > 0]
-    except Exception:
-        return None, None
-    if len(closes) < CONFIG["KLINE_MIN_POINTS"]:
-        return None, None
-    dd = 1 - closes[-1] / max(closes)
-    rets = [(b - a) / a for a, b in zip(closes, closes[1:])]
-    if len(rets) >= 2:
-        m = sum(rets) / len(rets)
-        vol = (sum((x - m) ** 2 for x in rets) / (len(rets) - 1)) ** 0.5
-    else:
-        vol = None
-    return dd, vol
-
-
-kline_metrics = {n: drawdown_metrics(k) for n, k in kline_raw.items()}
-
-df = base_df.copy(deep=True)
-# ============================================================
-# 6. V2.4 评分（纯悠悠盘口, 满分85）
-# ============================================================
-def stepped(value, steps, base):
-    """steps: [(阈值,得分)...] 取第一条满足的; 无数据返回0"""
-    if value is None or (isinstance(value, float) and value != value):
-        return 0
-    for th, sc in steps:
-        if value >= th:
-            return sc
-    return base
-
-
-def depth_score(row):
-    sc = row["youpin_sell_count"]
-    bc = row["youpin_buy_count"]
-    if not sc or sc <= 0:
-        return 0
-    s = stepped(bc / sc, CONFIG["DEPTH_STEPS"], CONFIG["DEPTH_BASE"])
-    if bc < CONFIG["DEPTH_MIN_BIDS"]:       # 挂买太少,比例再高也说服力不足
-        s = min(s, CONFIG["DEPTH_LOWBID_CAP"])
-    return s
-
-
-def tightness_score(row):
-    if not row["youpin_sell"] or not row["youpin_buy"]:
-        return 0
-    ratio = min(row["youpin_buy"] / row["youpin_sell"], 1.0)  # 溢价求购封顶:买一不可作退出价
-    return stepped(ratio, CONFIG["TIGHTNESS_STEPS"], CONFIG["TIGHTNESS_BASE"])
-
-
-def liquidity_score(row):
-    c = row["youpin_sell_count"]
-    if not c or c <= 0:
-        return 0
-    return stepped(c, CONFIG["LIQ_STEPS"], CONFIG["LIQ_BASE"])
-
-
-def quality_score(name):
-    if "★" in name:
-        return CONFIG["QUALITY_STAR"]
-    if re.search(r"\bHowl\b", name) or "Dragon Lore" in name:
-        return CONFIG["QUALITY_LEGEND"]
-    return CONFIG["QUALITY_BASE"]
-
-
-df["盘口深度分"] = df.apply(depth_score, axis=1)          # /30
-df["盘口紧密度分"] = df.apply(tightness_score, axis=1)    # /20
-df["流动性分"] = df.apply(liquidity_score, axis=1)        # /15
-df["品质分"] = df["marketHashName"].apply(quality_score)  # /20
-
-
-def volatility_score(vol):
-    """小时收益率波动越小得分越高：<=0.004 得5分，<=0.008 得3分，否则1分。"""
-    for threshold, points in CONFIG["DD_VOL_STEPS"]:
-        if vol <= threshold:
-            return points
-    return CONFIG["DD_VOL_BASE"]
-
-
-def drawdown_score(name):
-    """历史回撤分(满分15) = 回撤深度(10) + 趋势稳定(5); 缺K线给中性分"""
-    dd, vol = kline_metrics.get(name, (None, None))
-    if dd is None:
-        return CONFIG["KLINE_MISSING_SCORE"]
-    s = stepped(dd, CONFIG["DD_DEPTH_STEPS"], CONFIG["DD_DEPTH_BASE"])
-    s += volatility_score(vol) if vol is not None else 2
-    return s
-
-
-df["历史回撤分"] = df["marketHashName"].apply(drawdown_score)  # /15
-df["回撤深度"] = df["marketHashName"].map(lambda n: (kline_metrics.get(n) or (None, None))[0])
-df["V2.5总分"] = (df["盘口深度分"] + df["盘口紧密度分"] + df["流动性分"]
-                + df["品质分"] + df["历史回撤分"])  # 满分100
-
-# 多级排序: 总分 → 深度比 → 紧密度比 (并列分时优先盘口更厚的)
-df = df.sort_values(["V2.5总分", "挂买/挂卖", "买一/卖一"],
-                    ascending=False, na_position="last").reset_index(drop=True)
-df.insert(0, "排名", df.index + 1)
-
-# ============================================================
-# 7. 资金档位 + 总预算封顶分配
-# ============================================================
-def fund_from_score(score):
-    for th, amount in sorted(CONFIG["FUND_TIERS"], key=lambda x: -x[0]):
-        if score >= th:
-            return amount
-    return 0
-
-
-df["建议资金"] = df["V2.5总分"].apply(fund_from_score)
-
-if CONFIG["USE_BUDGET_CAP"]:
-    remaining = CONFIG["TOTAL_BUDGET"]
-    alloc = []
-    for v in df["建议资金"]:
-        a = min(v, remaining)
-        alloc.append(a)
-        remaining -= a
-    df["实际获批"] = alloc
-    print(f"总预算 {CONFIG['TOTAL_BUDGET']:,} | 已分配 {sum(alloc):,} | 剩余 {remaining:,}")
-else:
-    df["实际获批"] = df["建议资金"]
-
-# ============================================================
-# 8. 输出: Excel(美化) + Markdown + 每日快照
-# ============================================================
-today = now_cn().strftime("%Y-%m-%d")
-xlsx = f"CS2_V25_Daily_Report_{today}.xlsx"
-md = f"CS2_V25_Daily_Report_{today}.md"
-snap = f"snapshot_CS2_{today}.csv"
-
-price_cols = [c for c in df.columns if c.endswith("_sell") or c.endswith("_buy")]
-for c in price_cols:
-    df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
-
-missing_df = pd.DataFrame({"marketHashName": missing})
-
-with pd.ExcelWriter(xlsx, engine="openpyxl") as w:
-    df.to_excel(w, index=False, sheet_name="选品报告")
-    missing_df.to_excel(w, index=False, sheet_name="未匹配清单")
-    ws = w.sheets["选品报告"]
-
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.formatting.rule import ColorScaleRule
-    from openpyxl.utils import get_column_letter
-
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.freeze_panes = "C2"
-
-    for i, col in enumerate(df.columns, 1):
-        width = max(len(str(col)) * 1.6,
-                    df[col].astype(str).str.len().max() if len(df) else 10, 10)
-        ws.column_dimensions[get_column_letter(i)].width = min(width + 2, 42)
-
-    score_col_idx = list(df.columns).index("V2.5总分") + 1
-    letter = get_column_letter(score_col_idx)
-    ws.conditional_formatting.add(
-        f"{letter}2:{letter}{len(df) + 1}",
-        ColorScaleRule(start_type="min", start_color="F8696B",
-                       mid_type="percentile", mid_value=50, mid_color="FFEB84",
-                       end_type="max", end_color="63BE7B"))
-
-with open(md, "w", encoding="utf-8") as f:
-    f.write(f"# CS2 LeftSide V2.5 Daily（实时版）\n\n")
-    f.write(f"- 日期: {today}\n")
-    f.write(f"- 池内: {len(pool_names)} | 匹配: {len(matched)} | 未匹配: {len(missing)}\n")
-    f.write(f"- 单位: steamdt÷{div_steamdt} / youpin÷{div_youpin}\n")
-    f.write(f"- 预算: {CONFIG['TOTAL_BUDGET']:,} | 已分配: {int(df['实际获批'].sum()):,}\n\n")
-    f.write(df.head(CONFIG["MD_TOP_N"]).to_string())
-
-if CONFIG["SAVE_SNAPSHOT"]:
-    df.to_csv(snap, index=False, encoding="utf-8-sig")  # 积累历史,以后算真实回撤
-
-print("=" * 24)
-print("V2.5 完成（实时版" + ("·API拉取" if USE_LIVE else "·本地文件") + ")")
-print("=" * 24)
-pd.set_option("display.width", 200)
-pd.set_option("display.max_columns", None)
-pd.set_option("display.unicode.east_asian_width", True)
-print(df.head(20))
-
-if missing:
-    print(f"\n[提示] {len(missing)} 个池内物品未匹配到行情, 见Excel『未匹配清单』: ")
-    print("  " + ", ".join(missing[:10]) + ("..." if len(missing) > 10 else ""))
-
-for f_out in [xlsx, md] + ([snap] if CONFIG["SAVE_SNAPSHOT"] else []):
-    print("已保存:", f_out)
-
-# Colab浏览器有时会阻止连续下载：将全部结果打包为一次下载。
-if IN_COLAB:
-    from zipfile import ZipFile, ZIP_DEFLATED
-    archive = f"CS2_V25_Daily_Report_{today}.zip"
-    with ZipFile(archive, "w", compression=ZIP_DEFLATED) as bundle:
-        for report_path in [xlsx, md] + ([snap] if CONFIG["SAVE_SNAPSHOT"] else []):
-            bundle.write(report_path)
-    print("已打包下载:", archive)
-    print("报告已生成:", archive)
-
-# V2.6 使用原配置、原价格表和原 K 线指标。
-CONFIG = CONFIG_V26
-df = base_df.copy(deep=True)
-kline_metrics = {name: kline_features(k) for name, k in kline_raw.items()}
 # ============================================================
 # 6. V2.6：评分 + 左侧信号分级（不是未来收益预测）
 # ============================================================
@@ -1575,7 +1372,9 @@ def tightness_score(row):
 
 def liquidity_score(row):
     count = row["youpin_sell_count"]
-    return stepped(count, CONFIG["LIQ_STEPS"], CONFIG["LIQ_BASE"]) if count and count > 0 else 0
+    if not count or count <= 0:
+        return 0
+    return stepped(math.log10(count), CONFIG["LIQ_STEPS"], CONFIG["LIQ_BASE"])
 
 
 def quality_score(name):
@@ -1606,7 +1405,9 @@ def technical_scores(features):
         return score
     if features["age_hours"] > CONFIG["KLINE_STALE_HOURS"] or features["age_hours"] < -2:
         return score
-    score["回撤位置分"] = stepped(features["dd48"], CONFIG["POSITION_STEPS"], CONFIG["POSITION_BASE"])
+    # 回撤位置: 优先5日窗口dd120, 数据不足退回dd48
+    dd_for_position = features["dd120"] if features["dd120"] is not None else features["dd48"]
+    score["回撤位置分"] = stepped(dd_for_position, CONFIG["POSITION_STEPS"], CONFIG["POSITION_BASE"])
     if features["changes24"] < CONFIG["KLINE_MIN_CHANGES_24H"]:
         return score  # 长时间无价格变化不当作下跌动能消失
     early = deceleration_score(features["r12_prev"], features["r12_now"],
@@ -1614,20 +1415,27 @@ def technical_scores(features):
     medium = deceleration_score(features["r24_prev"], features["r24_now"],
                                 CONFIG["MIN_PREV_DROP_24H"])
     score["跌速减弱分"] = round(early + medium)
+    # 低点企稳改为联合判定: 未创新低 且 未大幅反弹 才计分
+    # (原为两项独立相加: "创新低很深+反弹0%"也能拿分, 逻辑不自洽)
     new_low = features["new_low_depth"]
+    new_low_score = 0
     if new_low is not None:
         if new_low <= 0.005:
-            score["低点企稳分"] += 6
+            new_low_score = 6
         elif new_low <= 0.015:
-            score["低点企稳分"] += 4
+            new_low_score = 4
         elif new_low <= 0.03:
-            score["低点企稳分"] += 2
+            new_low_score = 2
     rebound = features["rebound48"]
-    if rebound is not None:
-        if rebound <= 0.06:
-            score["低点企稳分"] += 4
-        elif rebound <= 0.10:
-            score["低点企稳分"] += 2
+    if rebound is None:
+        rebound_factor = 1.0          # 无反弹数据不惩罚
+    elif rebound <= CONFIG["REBOUND_FULL"]:
+        rebound_factor = 1.0
+    elif rebound <= CONFIG["REBOUND_HALF"]:
+        rebound_factor = 0.5
+    else:
+        rebound_factor = 0.0          # 已反弹较远, 左侧位置基本错过
+    score["低点企稳分"] = round(new_low_score * rebound_factor)
     down_prior, down_now = features["down_prev24"], features["down_now24"]
     if down_prior is not None and down_now is not None and down_prior > 0.0002:
         if down_now <= down_prior * 0.7:
@@ -1638,7 +1446,7 @@ def technical_scores(features):
 
 
 def signal_label(row, features, scores):
-    """宽松的观察分级：没有把'不创新低'设为入选门槛。"""
+    """观察分级: 含长期阴跌/反弹较远等排除项; 没有把'不创新低'设为入选门槛。"""
     if not row["youpin_sell"] or not row["youpin_buy"] or not row["youpin_sell_count"]:
         return "悠悠盘口不足"
     # 异常溢价求购单不剔除技术候选；只单独标注成交风险，资金暂缓。
@@ -1648,6 +1456,9 @@ def signal_label(row, features, scores):
         return "K线过期"
     if features["changes24"] < CONFIG["KLINE_MIN_CHANGES_24H"]:
         return "价格更新稀疏"
+    trend = features.get("trend_720")
+    if trend is not None and trend <= CONFIG["LONG_DECLINE_30D"]:
+        return "长期阴跌"  # 30日阴跌品, 短期减速多为下跌中继, 不出候选
     if features["rebound48"] is not None and features["rebound48"] > CONFIG["MAX_CANDIDATE_REBOUND"]:
         return "反弹较远"
     if features["dd48"] is None or features["dd48"] < CONFIG["MIN_CANDIDATE_DRAWDOWN"]:
@@ -1683,6 +1494,7 @@ for column in ("回撤位置分", "跌速减弱分", "低点企稳分", "下行�
 for column, feature in (("前12h涨跌", "r12_prev"), ("近12h涨跌", "r12_now"),
                         ("前24h涨跌", "r24_prev"), ("近24h涨跌", "r24_now"),
                         ("48h回撤", "dd48"), ("距48h低点", "rebound48"),
+                        ("5日回撤", "dd120"), ("5日涨跌", "r120"), ("30日涨跌", "trend_720"),
                         ("K线时效(小时)", "age_hours"), ("24h变价次数", "changes24")):
     df[column] = df["marketHashName"].map(lambda n: (kline_metrics.get(n) or {}).get(feature))
 df["信号状态"] = df["marketHashName"].map(label_map)
@@ -1780,7 +1592,8 @@ with open(md, "w", encoding="utf-8") as f:
     f.write(f"- 池内: {len(pool_names)} | 匹配: {len(matched)} | 未匹配: {len(missing)}\n")
     f.write(f"- 单位: steamdt÷{div_steamdt} / youpin÷{div_youpin}\n")
     f.write(f"- 预算: {CONFIG['TOTAL_BUDGET']:,} | 已分配: {int(df['实际获批'].sum()):,}\n\n")
-    f.write("- 评分: 盘口50 + 品质5 + 48h回撤位置10 + 跌速减弱20 + 低点企稳10 + 下行跌幅收敛5\n")
+    f.write("- 评分: 盘口50 + 品质5 + 5日回撤位置10 + 跌速减弱20 + 低点企稳10 + 下行跌幅收敛5\n")
+    f.write("- 本版改动: 回撤位置改120h窗口; 低点企稳改联合判定; 流动性log化降相关; 新增30日长期阴跌排除\n")
     f.write("- 信号仅为1–5天左侧候选；异常溢价求购不剔除候选，但不模拟拨款。\n")
     f.write("- 分数尚未回测，资金为模型模拟分配，非交易建议；下行收敛只代表价格变化，无成交量证据。\n")
     f.write(f"- 状态统计: {df['信号状态'].value_counts().to_dict()}\n\n")
@@ -1812,16 +1625,4 @@ if IN_COLAB:
         for report_path in [xlsx, md] + ([snap] if CONFIG["SAVE_SNAPSHOT"] else []):
             bundle.write(report_path)
     print("已打包下载:", archive)
-    print("报告已生成:", archive)
-
-if IN_COLAB:
-    from zipfile import ZipFile, ZIP_DEFLATED
-    archive = f"CS2_V25_V26_{today}.zip"
-    with ZipFile(archive, "w", ZIP_DEFLATED) as z:
-        for v in ("25", "26"):
-            for ext in ("xlsx", "md"):
-                p = f"CS2_V{v}_Daily_Report_{today}.{ext}"
-                z.write(p)
-        for p in (f"snapshot_CS2_{today}.csv", f"snapshot_CS2_V26_{today}.csv"):
-            if os.path.exists(p): z.write(p)
-    print("双报告已打包:", archive)
+    colab_files.download(archive)
